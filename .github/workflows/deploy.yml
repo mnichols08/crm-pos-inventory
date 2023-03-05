@@ -1,0 +1,161 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - prod
+
+concurrency:
+  group: deploy-${{ github.ref }}
+
+env:
+  NODE_VERSION: 14.x
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2.4.0
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v2.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        env:
+          CYPRESS_INSTALL_BINARY: 0 # Skip install of Cypress (handled in its own job)
+          HUSKY_SKIP_INSTALL: 1 # Skip install of Husky
+        run: |
+          npm ci --loglevel error
+          npm --prefix functions ci --loglevel error
+
+      - name: Set environment
+        run: |
+          # Get branch name from github ref (i.e. refs/heads/master -> master)
+          gitBranch=${GITHUB_REF##*/}
+
+          # Find the config associated to the firebase project in .firebaserc (falling back to default)
+          gcloudProject=$(cat .firebaserc | jq -r --arg alias "$gitBranch" '.projects[$alias] // .projects.default')
+          appName=crm-pos-inventory
+
+          echo "Setting environment for branch: $gitBranch, project: $gcloudProject, and app: $appName..."
+
+          # Set variables to environment to be used in later steps
+          echo "GCLOUD_PROJECT=$gcloudProject" >> $GITHUB_ENV
+          echo "NODE_CONFIG_ENV=$branch" >> $GITHUB_ENV
+          echo "ENV=$branch" >> $GITHUB_ENV
+
+      - name: Generate Firebase SDK config for ${{ env.GCLOUD_PROJECT }}
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          set -o pipefail
+
+          # Throw a clear error if FIREBASE_TOKEN secret is not set
+          if [ -z "$FIREBASE_TOKEN" ];
+            then
+              missingTokenErrMsg="\"FIREBASE_TOKEN\" github secret is required to load project configuration. Visit https://github.com/${{ github.repository }}/settings/secrets to set."
+              echo "::error ::$missingTokenErrMsg"
+              exit 1
+          fi
+
+          bin/get-firebase-sdk-config.js --file ./config/default.json
+
+      - name: Verify App
+        run: |
+          npm run lint # Check for lint in app code
+
+      # NOTE: Skipped because of "Channel credentials must be a ChannelCredentials object" error from firebase-admin
+      # See https://github.com/firebase/firebase-tools/issues/2207 for more info
+      # - name: Unit Test Functions
+      #   run: |
+      #     npm run functions:test:cov -- --project $GCLOUD_PROJECT # Run unit tests with coverage
+
+      # - name: Upload Test Coverage For Functions
+      #   # NOTE: Token will need to be added if using codecov with private repos
+      #   run: |
+      #     bash <(curl -s https://codecov.io/bash) -f functions/coverage/lcov.info || echo 'Codecov failed to upload'
+
+      - name: Build Functions
+        run: |
+          npm run functions:build
+
+      - name: Build App
+        run: |
+          npm run build
+
+      # Archive build in case it needs to be downloaded later for debugging
+      - name: Archive Build Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: build
+          path: build
+
+      - name: Deploy to Firebase
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+        # Deploy to project associated with branch name alias in .firebaserc with message set to commit's message.
+        # Force flag is used to automatically delete any removed cloud functions
+        run: |
+          $(npm bin)/firebase-ci deploy -s --force
+
+      # Archive debug logs if deploy fails
+      - name: Archive Debug Logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: debug-logs
+          path: ./*.log
+
+      - name: Check if version has been updated
+        if: github.ref == 'refs/heads/prod'
+        id: check
+        uses: EndBug/version-check@v2.0.1
+
+      - name: Create Github Release
+        if: github.ref == 'refs/heads/prod' && steps.check.outputs.changed == 'true'
+        id: create_release
+        uses: actions/create-release@v1.1.4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag_name: v${{ env.PACKAGE_VERSION }}
+          release_name: v${{ env.PACKAGE_VERSION }}
+          draft: false
+          prerelease: false
+
+      - name: Create Sentry Release
+        if: github.ref == 'refs/heads/prod' && steps.check.outputs.changed == 'true'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: mnichols08
+          SENTRY_PROJECT: crm-pos-inventory
+        run: |
+          # Throw a clear error if SENTRY_AUTH_TOKEN secret is not set
+          if [ -z "$SENTRY_AUTH_TOKEN" ];
+            then
+              warningMsg="\"SENTRY_AUTH_TOKEN\" github secret is required to create releases in Sentry. Visit https://github.com/${{ github.repository }}/settings/secrets to set."
+              echo "::warning ::$warningMsg"
+              exit 0
+          fi
+          gitBranch=${GITHUB_REF##*/}
+          releaseSuffix=$(if [ $gitBranch != "prod" ]; then echo $gitBranch; fi;)@$PACKAGE_VERSION
+          releaseName=crm-pos-inventory-$releaseSuffix
+
+          echo Creating Sentry release \"$releaseName\" for project \"$SENTRY_PROJECT\"...
+          $(yarn bin)/sentry-cli releases new $releaseName --finalize
+
+          echo Uploading source maps to Sentry release...
+          $(yarn bin)/sentry-cli releases files $releaseName upload-sourcemaps ./build/static/js --no-rewrite
+
+          echo Associating commits with the Sentry release...
+          $(yarn bin)/sentry-cli releases set-commits --auto $PACKAGE_VERSION

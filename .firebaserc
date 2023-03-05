@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "crm-pos-inv",
+    "main": "crm-pos-inv",
+    "prod": "crm-pos-inv"
+  }
+}

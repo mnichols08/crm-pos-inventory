@@ -1,0 +1,120 @@
+name: Verify
+
+on: [pull_request]
+
+concurrency:
+  group: verify-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 14.x
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2.4.0
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v2.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        env:
+          CYPRESS_INSTALL_BINARY: 0 # Skip install of Cypress (handled in its own job)
+          HUSKY_SKIP_INSTALL: 1 # Skip install of Husky
+        run: |
+          npm ci --loglevel error
+          npm --prefix functions ci --loglevel error
+
+      - name: Set environment
+        run: |
+          # Get branch name from github ref (i.e. refs/heads/master -> master)
+          gitBranch=${GITHUB_REF##*/}
+
+          # Find the config associated to the firebase project in .firebaserc (falling back to default)
+          gcloudProject=$(cat .firebaserc | jq -r --arg alias "$gitBranch" '.projects[$alias] // .projects.default')
+          appName=crm-pos-inventory
+
+          echo "Setting environment for branch: $gitBranch, project: $gcloudProject, and app: $appName..."
+
+          # Set variables to environment to be used in later steps
+          echo "GCLOUD_PROJECT=$gcloudProject" >> $GITHUB_ENV
+          echo "NODE_CONFIG_ENV=$branch" >> $GITHUB_ENV
+          echo "NODE_APP_INSTANCE=emulators" >> $GITHUB_ENV
+          echo "ENV=$branch" >> $GITHUB_ENV
+
+          if [[ -v $SERVICE_ACCOUNT ]]; then
+            echo "SERVICE_ACCOUNT_EXISTS=true" >> $GITHUB_ENV
+          else
+            message="SERVICE_ACCOUNT secret must be set to deploy to preview channel - skipping"
+            echo "::warning title=SERVICE_ACCOUNT secret missing::$message"
+          fi
+
+      - name: Generate Firebase SDK config for ${{ env.GCLOUD_PROJECT }}
+        # Skip for forks (since they don't have access to secrets)
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          set -o pipefail
+
+          # Throw a clear error if FIREBASE_TOKEN secret is not set
+          if [ -z "$FIREBASE_TOKEN" ];
+            then
+              missingTokenErrMsg="\"FIREBASE_TOKEN\" github secret is required to load project configuration. Generate by calling firebase login:ci then visit https://github.com/${{ github.repository }}/settings/secrets to set."
+              echo "::error ::$missingTokenErrMsg"
+              exit 1
+          fi
+
+          bin/get-firebase-sdk-config.js --file ./config/default.json
+
+      - name: Verify App
+        run: |
+          npm run lint # Check for lint in app code
+
+      - name: Unit Test Functions
+        run: |
+          echo "Setting emulator settings to environment..."
+          # Set variables to environment to be used in later steps
+          echo "FIREBASE_AUTH_EMULATOR_HOST=$(cat firebase.json | jq .emulators.auth.port)" >> $GITHUB_ENV
+          echo "FIREBASE_DATABASE_EMULATOR_HOST=$(cat firebase.json | jq .emulators.database.port)" >> $GITHUB_ENV
+          echo "FIRESTORE_EMULATOR_HOST=localhost:$(cat firebase.json | jq .emulators.firestore.port)" >> $GITHUB_ENV
+
+          # Run tests and generate coverage
+          npm run functions:test:cov --project $GCLOUD_PROJECT # Run unit tests with coverage
+
+      - name: Upload Test Coverage For Functions
+        # NOTE: Token will need to be added if using codecov with private repos
+        run: |
+          bash <(curl -s https://codecov.io/bash) -f functions/coverage/lcov.info || echo 'Codecov failed to upload'
+
+      - name: Build Functions
+        run: |
+          npm run functions:build
+
+      - name: Build App
+        run: |
+          npm run build
+
+      - name: Deploy to Firebase hosting preview channel
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        if: env.SERVICE_ACCOUNT_EXISTS
+        id: preview-deploy
+        with:
+          repoToken: "${{ secrets.GITHUB_TOKEN }}"
+          firebaseServiceAccount: "${{ secrets.SERVICE_ACCOUNT }}"
+          expires: 7d
+          projectId: ${{ env.GCLOUD_PROJECT }}
+
+      - name: Archive Build Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: build
+          path: build
