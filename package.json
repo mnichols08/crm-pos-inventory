@@ -60,7 +60,7 @@
   },
   "devDependencies": {
     "@craco/craco": "6.3.0",
-    "@sentry/cli": "^1.69.1",
+    "@sentry/cli": "^2.14.3",
     "babel-eslint": "^10.1.0",
     "config": "^3.3.6",
     "cross-env": "^7.0.3",
