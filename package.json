@@ -79,7 +79,7 @@
     "eslint-plugin-react-hooks": "^4.3.0",
     "eslint-plugin-standard": "^5.0.0",
     "firebase-ci": "^0.15.0",
-    "firebase-tools": "^9.23.0",
+    "firebase-tools": "^11.24.0",
     "lint-staged": "^13.1.2",
     "husky": "^8.0.3", 
     "minimist": "1.2.8",
