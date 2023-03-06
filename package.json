@@ -59,7 +59,7 @@
     "stackdriver-errors-js": "^0.12.0"
   },
   "devDependencies": {
-    "@craco/craco": "6.3.0",
+    "@craco/craco": "6.4.5",
     "@sentry/cli": "^2.14.3",
     "babel-eslint": "^10.1.0",
     "config": "^3.3.6",
