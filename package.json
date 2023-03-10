@@ -41,7 +41,7 @@
     "@mui/icons-material": "^5.2.0",
     "@mui/material": "^5.2.2",
     "@mui/styles": "^5.2.2",
-    "@sentry/browser": "^6.15.0",
+    "@sentry/browser": "^7.42.0",
     "firebase": "^9.5.0",
     "notistack": "^2.0.3",
     "prop-types": "^15.7.2",
